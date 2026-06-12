@@ -1,0 +1,466 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Random;
+
+public class Minecraft3D extends JPanel implements ActionListener, KeyListener, MouseMotionListener, MouseListener {
+
+    private static final int TARGET_FPS = 60;
+    private static final int SCREEN_WIDTH = 1024;
+    private static final int SCREEN_HEIGHT = 768;
+    
+    // --- Optimized Map Scaling & Culling Parameters ---
+    private static final int MAP_SIZE = 128; // Massive world dimension scale
+    private static final int MAP_HEIGHT = 32;
+    private static final int RENDER_DISTANCE = 10; // Tight render radius to optimize CPU/RAM efficiency
+
+    // --- Player / Camera Configuration Setup ---
+    private double playerX, playerY, playerZ;
+    private double yaw = 0.0, pitch = 0.0;
+    private double velX = 0, velY = 0, velZ = 0;
+    private boolean isGrounded = false;
+    private boolean moveF = false, moveB = false, moveL = false, moveR = false;
+    
+    // Animations States
+    private double armSwingTime = 0;
+    private double jumpBobAnim = 0;
+
+    // --- Core Systems & Inventories ---
+    private int[][][] world = new int[MAP_SIZE][MAP_HEIGHT][MAP_SIZE];
+    private ArrayList<VoxelFace> renderQueue = new ArrayList<>();
+    private ArrayList<DroppedItem> droppedItems = new ArrayList<>();
+    
+    // Inventory Counts: [0: None, 1: Grass, 2: Sand, 3: Wood, 4: Stone, 5: Water]
+    private int[] inventory = new int[6]; 
+    private boolean showInventoryUI = false;
+    private int selectedHotbar = 1;
+
+    // Block ID Types Registry
+    private static final int AIR = 0, GRASS = 1, TAIGA_GRASS = 2, SAND = 3, DIRT = 4, STONE = 5, LOG = 6, LEAVES = 7, WATER = 8;
+
+    private Robot robot;
+    private boolean isMouseLocked = false;
+    private final int centerX = SCREEN_WIDTH / 2, centerY = SCREEN_HEIGHT / 2;
+    private Random random = new Random();
+
+    public Minecraft3D() {
+        setPreferredSize(new Dimension(SCREEN_WIDTH, SCREEN_HEIGHT));
+        setBackground(new Color(135, 201, 250)); // Atmospheric Sky Tint
+        setFocusable(true);
+
+        addKeyListener(this);
+        addMouseMotionListener(this);
+        addMouseListener(this);
+
+        try {
+            robot = new Robot();
+        } catch (Exception e) { e.printStackTrace(); }
+
+        // Set invisible cursor configuration
+        setCursor(getToolkit().createCustomCursor(new BufferedImage(1,1,BufferedImage.TYPE_INT_ARGB), new Point(), null));
+
+        generateWorld();
+        findSafeSpawnPoint();
+
+        new Timer(1000 / TARGET_FPS, this).start();
+    }
+
+    // --- Procedural Generation & Biome Layout ---
+    private void generateWorld() {
+        for (int x = 0; x < MAP_SIZE; x++) {
+            for (int z = 0; z < MAP_SIZE; z++) {
+                String biome = "FOREST"; int surfaceBlock = GRASS;
+                if (x < 45) { biome = "TAIGA"; surfaceBlock = TAIGA_GRASS; } 
+                else if (x > 85) { biome = "DESERT"; surfaceBlock = SAND; }
+
+                // Generates smooth rolling hill nodes
+                int surfaceY = 6;
+                if (biome.equals("TAIGA")) surfaceY = (int) (7 + Math.sin(x * 0.2) * 3 + Math.cos(z * 0.2) * 1.5);
+                else if (biome.equals("FOREST")) surfaceY = (int) (6 + Math.sin(x * 0.15) * 2 + Math.cos(z * 0.15) * 1);
+                else surfaceY = (int) (4 + Math.sin(x * 0.05) * 0.5);
+
+                for (int y = 0; y < MAP_HEIGHT; y++) {
+                    if (y == surfaceY) world[x][y][z] = surfaceBlock;
+                    else if (y < surfaceY && y >= surfaceY - 2) world[x][y][z] = (biome.equals("DESERT")) ? SAND : DIRT;
+                    else if (y < surfaceY - 2) world[x][y][z] = STONE;
+                    else if (y > surfaceY && y <= 5) world[x][y][z] = WATER; // Static water level baseline
+                    else world[x][y][z] = AIR;
+                }
+
+                // Populate vegetation assets above water lines
+                if (surfaceY > 5 && random.nextDouble() < 0.035) {
+                    if (biome.equals("FOREST")) buildTree(x, surfaceY + 1, z);
+                    else if (biome.equals("DESERT")) world[x][surfaceY + 1][z] = TAIGA_GRASS; // Cactus mimic
+                }
+            }
+        }
+    }
+
+    private void buildTree(int tx, int ty, int tz) {
+        for (int i = 0; i < 4; i++) if (ty + i < MAP_HEIGHT) world[tx][ty + i][tz] = LOG;
+        int ly = ty + 3;
+        for (int lx = tx - 1; lx <= tx + 1; lx++) {
+            for (int lz = tz - 1; lz <= tz + 1; lz++) {
+                if (lx >= 0 && lx < MAP_SIZE && lz >= 0 && lz < MAP_SIZE && ly < MAP_HEIGHT) {
+                    if (world[lx][ly][lz] == AIR) world[lx][ly][lz] = LEAVES;
+                }
+            }
+        }
+    }
+
+    // --- Fixed Safe Spawn Implementation ---
+    private void findSafeSpawnPoint() {
+        int midX = MAP_SIZE / 2;
+        int midZ = MAP_SIZE / 2;
+        // Search downwards from the sky to find the highest ground block
+        for (int y = MAP_HEIGHT - 1; y >= 0; y--) {
+            int blockType = world[midX][y][midZ];
+            if (blockType != AIR && blockType != WATER) {
+                playerX = midX + 0.5;
+                playerY = y + 2.6; // Place eyes exactly at head level above ground
+                playerZ = midZ + 0.5;
+                return;
+            }
+        }
+        // Emergency fall-back position coordinates if midpoint is somehow an ocean gap
+        playerX = 64.5; playerY = 15.0; playerZ = 64.5;
+    }
+
+    // --- Core Engine Cycle (Physics & AABB Collision Core) ---
+    @Override
+    public void actionPerformed(ActionEvent e) {
+        if (showInventoryUI) { repaint(); return; } // Pause physics operations while managing inventory
+
+        // Process Input Directions Vectors
+        double cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+        double fX = -sinY, fZ = cosY;
+        double rX = cosY, rZ = sinY;
+
+        double moveX = 0, moveZ = 0;
+        if (moveF) { moveX += fX; moveZ += fZ; }
+        if (moveB) { moveX -= fX; moveZ -= fZ; }
+        if (moveL) { moveX -= rX; moveZ -= rZ; }
+        if (moveR) { moveX += rX; moveZ += rZ; }
+
+        double length = Math.sqrt(moveX * moveX + moveZ * moveZ);
+        if (length > 0) { moveX /= length; moveZ /= length; }
+
+        velX = moveX * 0.12;
+        velZ = moveZ * 0.12;
+        velY -= 0.014; // Constant gravity force component
+
+        // 3D Voxel Slider AABB Collision Resolution Matrix
+        if (canMoveTo(playerX + velX, playerY, playerZ)) playerX += velX;
+        if (canMoveTo(playerX, playerY + velY, playerZ)) {
+            playerY += velY;
+            isGrounded = false;
+        } else {
+            if (velY < 0) isGrounded = true; // Landed on surface floor safely
+            velY = 0;
+        }
+        if (canMoveTo(playerX, playerY, playerZ + velZ)) playerZ += velZ;
+
+        // Timers & Animations Step Calculations
+        if (armSwingTime > 0) armSwingTime -= 0.15;
+        if (isGrounded) {
+            if (jumpBobAnim > 0) jumpBobAnim -= 0.1;
+        } else {
+            jumpBobAnim = Math.sin(System.currentTimeMillis() * 0.01) * 0.08; // Head shake when falling
+        }
+
+        // Process item magnetic pulls and player pickups boundaries
+        updateItemPickups();
+
+        repaint();
+    }
+
+    private boolean canMoveTo(double nx, double ny, double nz) {
+        // Calculate player collision box tracking bounds offset sizes
+        double r = 0.3; // Width check
+        int[][] checkPoints = {
+            {(int)(nx-r), (int)(ny-1.6), (int)(nz-r)}, {(int)(nx+r), (int)(ny-1.6), (int)(nz-r)},
+            {(int)(nx-r), (int)(ny-1.6), (int)(nz+r)}, {(int)(nx+r), (int)(ny-1.6), (int)(nz+r)},
+            {(int)(nx-r), (int)(ny-0.2), (int)(nz-r)}, {(int)(nx+r), (int)(ny-0.2), (int)(nz-r)},
+            {(int)(nx-r), (int)(ny-0.2), (int)(nz+r)}, {(int)(nx+r), (int)(ny-0.2), (int)(nz+r)}
+        };
+        for (int[] pt : checkPoints) {
+            if (pt[0] < 0 || pt[0] >= MAP_SIZE || pt[1] < 0 || pt[1] >= MAP_HEIGHT || pt[2] < 0 || pt[2] >= MAP_SIZE) return false;
+            int block = world[pt[0]][pt[1]][pt[2]];
+            if (block != AIR && block != WATER) return false; // Immediate collision obstruction
+        }
+        return true;
+    }
+
+    private void updateItemPickups() {
+        for (int i = droppedItems.size() - 1; i >= 0; i--) {
+            DroppedItem item = droppedItems.get(i);
+            double dx = item.x - playerX;
+            double dy = item.y - playerY;
+            double dz = item.z - playerZ;
+            double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+            if (dist < 1.5) { // Magnetic vacuum pickup threshold range
+                int invIdx = mapBlockToInventoryIndex(item.type);
+                if (invIdx > 0) inventory[invIdx]++;
+                droppedItems.remove(i);
+            }
+        }
+    }
+
+    private int mapBlockToInventoryIndex(int bType) {
+        if (bType == GRASS || bType == TAIGA_GRASS) return 1;
+        if (bType == SAND) return 2;
+        if (bType == LOG) return 3;
+        if (bType == STONE) return 4;
+        if (bType == WATER) return 5;
+        return 0;
+    }
+
+    // --- High-Performance Render Pipe (Proximity Culling Enabled) ---
+    @Override
+    protected void paintComponent(Graphics g) {
+        super.paintComponent(g);
+        Graphics2D g2 = (Graphics2D) g;
+        renderQueue.clear();
+
+        double cosY = Math.cos(-yaw), sinY = Math.sin(-yaw);
+        double cosP = Math.cos(-pitch), sinP = Math.sin(-pitch);
+
+        int pGridX = (int) playerX;
+        int pGridZ = (int) playerZ;
+
+        // HIGHLY OPTIMIZED: Scan block data ONLY inside the immediate render distance perimeter surrounding the player
+        int minX = Math.max(0, pGridX - RENDER_DISTANCE);
+        int maxX = Math.min(MAP_SIZE - 1, pGridX + RENDER_DISTANCE);
+        int minZ = Math.max(0, pGridZ - RENDER_DISTANCE);
+        int maxZ = Math.min(MAP_SIZE - 1, pGridZ + RENDER_DISTANCE);
+
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int y = 0; y < MAP_HEIGHT; y++) {
+                    int type = world[x][y][z];
+                    if (type == AIR) continue;
+
+                    double rx = x - playerX + 0.5;
+                    double ry = (y - playerY + 0.5) + jumpBobAnim; // Offset viewport rendering coordinates via jump matrices
+                    double rz = z - playerZ + 0.5;
+
+                    double tx = rx * cosY - rz * sinY;
+                    double tz = rx * sinY + rz * cosY;
+                    double ty = ry * cosP - tz * sinP;
+                    double depth = ry * sinP + tz * cosP;
+
+                    if (depth <= 0.3) continue; // Skip hidden back-face profiles
+
+                    addCubeToRenderPipeline(x, y, z, depth, type, false);
+                }
+            }
+        }
+
+        // Project floating items into the rendering workspace
+        for (DroppedItem it : droppedItems) {
+            double rx = it.x - playerX; double ry = it.y - playerY + Math.sin(System.currentTimeMillis()*0.005)*0.1; double rz = it.z - playerZ;
+            double tx = rx * cosY - rz * sinY; double tz = rx * sinY + rz * cosY;
+            double ty = ry * cosP - tz * sinP; double depth = ry * sinP + tz * cosP;
+            if (depth > 0.3) addCubeToRenderPipeline((int)it.x, (int)it.y, (int)it.z, depth, it.type, true);
+        }
+
+        // Painter's algorithm depth sort
+        Collections.sort(renderQueue, (a, b) -> Double.compare(b.depth, a.depth));
+        for (VoxelFace face : renderQueue) {
+            g2.setColor(face.color); g2.fillPolygon(face.poly);
+            g2.setColor(new Color(0,0,0,38)); g2.drawPolygon(face.poly);
+        }
+
+        // Render crosshair UI overlay
+        g2.setColor(Color.WHITE); g2.drawString("+", centerX - 4, centerY + 6);
+
+        // --- View Model Arm Punch Animation Layer ---
+        drawAnimatedPlayerArm(g2);
+
+        // --- Render HUD Core panels ---
+        drawGameHUD(g2);
+    }
+
+    private void addCubeToRenderPipeline(int x, int y, int z, double depth, int type, boolean isItem) {
+        Color col = Color.GRAY;
+        switch (type) {
+            case GRASS: col = new Color(90, 140, 50); break;
+            case TAIGA_GRASS: col = new Color(40, 80, 35); break;
+            case SAND: col = new Color(220, 195, 125); break;
+            case DIRT: col = new Color(125, 85, 55); break;
+            case STONE: col = new Color(105, 105, 105); break;
+            case LOG: col = new Color(85, 60, 40); break;
+            case LEAVES: col = new Color(50, 110, 40); break;
+            case WATER: col = new Color(45, 105, 195, 170); break;
+        }
+        if (isItem) col = col.brighter(); // Highlight dropped elements
+
+        double s = isItem ? 0.25 : 1.0; // Shrink geometry bounds scale parameters if rendering item entity drops
+        double offset = isItem ? 0.35 : 0.0;
+        double[][] v = {
+            {x+offset, y+offset, z+offset}, {x+s+offset, y+offset, z+offset}, {x+s+offset, y+s+offset, z+offset}, {x+offset, y+s+offset, z+offset},
+            {x+offset, y+offset, z+s+offset}, {x+s+offset, y+offset, z+s+offset}, {x+s+offset, y+s+offset, z+s+offset}, {x+offset, y+s+offset, z+s+offset}
+        };
+        int[][] faces = {{0,1,2,3}, {1,5,6,2}, {5,4,7,6}, {4,0,3,7}, {3,2,6,7}, {4,5,1,0}};
+
+        double cosY = Math.cos(-yaw), sinY = Math.sin(-yaw);
+        double cosP = Math.cos(-pitch), sinP = Math.sin(-pitch);
+
+        for (int[] f : faces) {
+            Polygon p = new Polygon(); boolean valid = true;
+            for (int idx : f) {
+                double rx = v[idx][0] - playerX; double ry = (v[idx][1] - playerY) + jumpBobAnim; double rz = v[idx][2] - playerZ;
+                double tx = rx * cosY - rz * sinY; double tz = rx * sinY + rz * cosY;
+                double ty = ry * cosP - tz * sinP; double tq = ry * sinP + tz * cosP;
+                if (tq <= 0.15) { valid = false; break; }
+                p.addPoint((int)(centerX + (tx * 600.0 / tq)), (int)(centerY - (ty * 600.0 / tq)));
+            }
+            if (valid) renderQueue.add(new VoxelFace(p, depth, col));
+        }
+    }
+
+    private void drawAnimatedPlayerArm(Graphics2D g2) {
+        int armX = SCREEN_WIDTH - 220;
+        int armY = SCREEN_HEIGHT - 240;
+        // Apply swinging displacement transforms if timer flag context is tripped
+        if (armSwingTime > 0) {
+            armX -= (int)(Math.sin(armSwingTime * Math.PI) * 45);
+            armY += (int)(Math.sin(armSwingTime * Math.PI) * 35);
+        }
+        g2.setColor(new Color(210, 160, 125)); // Skin
+        g2.fillRect(armX + 40, armY + 60, 90, 200);
+        g2.setColor(new Color(40, 160, 170)); // Teal Shirt Sleeve
+        g2.fillRect(armX, armY, 130, 90);
+    }
+
+    private void drawGameHUD(Graphics2D g2) {
+        g2.setColor(new Color(0,0,0,140));
+        g2.fillRect(20, 20, 360, 60);
+        g2.setColor(Color.WHITE);
+        g2.drawString("HOTBAR SELECTION: [Keys 1-5]", 35, 40);
+        g2.drawString("PRESS 'T' TO SHOW FULL INVENTORY OVERLAY", 35, 58);
+
+        // Render Hotbar Square Containers
+        for (int i = 0; i < 5; i++) {
+            int bx = SCREEN_WIDTH / 2 - 110 + (i * 45);
+            g2.setColor(new Color(40,40,40,210));
+            g2.fillRect(bx, SCREEN_HEIGHT - 80, 40, 40);
+            if (selectedHotbar == i + 1) {
+                g2.setColor(Color.GREEN); g2.drawRect(bx-1, SCREEN_HEIGHT-81, 42, 42);
+            }
+        }
+
+        // Draw Full Overlay Inventory Menu Panel if active toggled
+        if (showInventoryUI) {
+            g2.setColor(new Color(20, 20, 20, 240));
+            g2.fillRect(250, 180, 524, 400);
+            g2.setColor(Color.WHITE);
+            g2.setFont(new Font("Arial", Font.BOLD, 22));
+            g2.drawString("PLAYER STORAGE MANAGEMENT [T]", 290, 230);
+            g2.setFont(new Font("Arial", Font.PLAIN, 16));
+            String[] labels = {"1. GRASS BLOCKS: ", "2. SAND VOXELS:  ", "3. OAK LOG WOOD: ", "4. HARD STONE:   ", "5. WATER ITEMS:  "};
+            for (int i = 1; i <= 5; i++) {
+                g2.drawString(labels[i-1] + inventory[i] + " units", 320, 260 + (i * 45));
+            }
+        }
+    }
+
+    // --- Mouse & Input Interactions Handlers ---
+    @Override
+    public void mousePressed(MouseEvent e) {
+        if (!isMouseLocked) { isMouseLocked = true; return; }
+        if (showInventoryUI) return;
+
+        if (e.getButton() == MouseEvent.BUTTON1) {
+            armSwingTime = 1.0; // Trigger punch graphic step calculations loop
+
+            // Execution line tracking raycast
+            double cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+            double cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+            double dx = -sinY * cosP; double dy = sinP; double dz = cosY * cosP;
+
+            for (double d = 0.5; d < 5.0; d += 0.15) {
+                int bx = (int)(playerX + dx * d); int by = (int)(playerY + dy * d); int bz = (int)(playerZ + dz * d);
+                if (bx >= 0 && bx < MAP_SIZE && by >= 0 && by < MAP_HEIGHT && bz >= 0 && bz < MAP_SIZE) {
+                    int targeted = world[bx][by][bz];
+                    if (targeted != AIR && targeted != WATER) {
+                        // Drop block item into world stack space
+                        droppedItems.add(new DroppedItem(bx + 0.5, by + 0.4, bz + 0.5, targeted));
+                        world[bx][by][bz] = AIR; // Destroy voxel instance
+                        break;
+                    }
+                }
+            }
+        } else if (e.getButton() == MouseEvent.BUTTON3) { // Place selected item block
+            // Implement raycast reverse path placement indexing here logic...
+        }
+    }
+
+    @Override
+    public void keyPressed(KeyEvent e) {
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_W: moveF = true; break;
+            case KeyEvent.VK_S: moveB = true; break;
+            case KeyEvent.VK_A: moveL = true; break;
+            case KeyEvent.VK_D: moveR = true; break;
+            case KeyEvent.VK_SPACE: if (isGrounded) { velY = 0.26; isGrounded = false; jumpBobAnim = 0.25; } break;
+            case KeyEvent.VK_T: showInventoryUI = !showInventoryUI; isMouseLocked = !showInventoryUI; break;
+            case KeyEvent.VK_ESCAPE: isMouseLocked = false; break;
+            case KeyEvent.VK_1: selectedHotbar = 1; break;
+            case KeyEvent.VK_2: selectedHotbar = 2; break;
+            case KeyEvent.VK_3: selectedHotbar = 3; break;
+            case KeyEvent.VK_4: selectedHotbar = 4; break;
+            case KeyEvent.VK_5: selectedHotbar = 5; break;
+        }
+    }
+
+    @Override
+    public void keyReleased(KeyEvent e) {
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_W: moveF = false; break;
+            case KeyEvent.VK_S: moveB = false; break;
+            case KeyEvent.VK_A: moveL = false; break;
+            case KeyEvent.VK_D: moveR = false; break;
+        }
+    }
+
+    @Override
+    public void mouseMoved(MouseEvent e) {
+        if (!isMouseLocked || showInventoryUI) return;
+        int diffX = e.getX() - centerX; int diffY = e.getY() - centerY;
+        yaw += diffX * 0.003; pitch -= diffY * 0.003;
+        if (pitch > 1.4) pitch = 1.4; if (pitch < -1.4) pitch = -1.4;
+        Point p = getLocationOnScreen();
+        robot.mouseMove(p.x + centerX, p.y + centerY);
+    }
+
+    @Override public void mouseDragged(MouseEvent e) { mouseMoved(e); }
+    @Override public void keyTyped(KeyEvent e) {}
+    @Override public void mouseClicked(MouseEvent e) {}
+    @Override public void mouseReleased(MouseEvent e) {}
+    @Override public void mouseEntered(MouseEvent e) {}
+    @Override public void mouseExited(MouseEvent e) {}
+
+    public static void main(String[] args) {
+        JFrame f = new JFrame("Minecraft 3D Engine Optimization");
+        Minecraft3D canvas = new Minecraft3D(); f.add(canvas); f.pack();
+        f.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE); f.setLocationRelativeTo(null);
+        f.setResizable(false); f.setVisible(true);
+    }
+}
+
+// --- Face Mapper Primitive Struct Descriptor ---
+class VoxelFace {
+    Polygon poly; double depth; Color color;
+    public VoxelFace(Polygon poly, double depth, Color color) { this.poly = poly; this.depth = depth; this.color = color; }
+}
+
+// --- Dropped Floating Item Primitive Struct Data ---
+class DroppedItem {
+    double x, y, z; int type;
+    public DroppedItem(double x, double y, double z, int type) { this.x = x; this.y = y; this.z = z; this.type = type; }
+}
